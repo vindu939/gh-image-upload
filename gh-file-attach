@@ -1,0 +1,414 @@
+#!/usr/bin/env bash
+# gh-file-attach — Attach files to GitHub and get shareable URLs
+# Replicates GitHub's "Attach files" feature from the CLI
+# https://github.com/vindu939/gh-file-attach
+#
+# Usage:
+#   gh file-attach <file> [<file>...]
+#   gh file-attach -m "Label:file.png" [...]
+#   gh file-attach --repo owner/repo <file>
+
+set -euo pipefail
+
+VERSION="1.0.0"
+RELEASE_TAG="_attachments"
+RELEASE_TITLE="Attachments"
+RELEASE_BODY="Auto-managed release for file attachments. Do not delete."
+
+# Size limits per category (bytes)
+MAX_IMAGE_SIZE=$((50 * 1024 * 1024))    # 50 MB
+MAX_VIDEO_SIZE=$((200 * 1024 * 1024))   # 200 MB
+MAX_AUDIO_SIZE=$((50 * 1024 * 1024))    # 50 MB
+MAX_DOCUMENT_SIZE=$((25 * 1024 * 1024)) # 25 MB
+MAX_CODE_SIZE=$((10 * 1024 * 1024))     # 10 MB
+MAX_ARCHIVE_SIZE=$((50 * 1024 * 1024))  # 50 MB
+MAX_OTHER_SIZE=$((25 * 1024 * 1024))    # 25 MB
+
+# --- File Type Classification ------------------------------------------------
+
+# Returns: image, video, audio, document, code, archive, text, other, unsupported
+classify_file() {
+  local ext="$1"
+  case "$ext" in
+    # Images
+    png|jpg|jpeg|gif|webp|svg|bmp|ico|tiff|tif|avif)
+      echo "image" ;;
+    # Videos
+    mp4|mov|webm|avi|mkv)
+      echo "video" ;;
+    # Audio
+    mp3|wav|ogg|flac|aac|m4a)
+      echo "audio" ;;
+    # Documents
+    pdf|docx|pptx|xlsx|xls|xlsm|rtf|doc|odt|fodt|ods|fods|odp|fodp|odg|fodg|odf)
+      echo "document" ;;
+    # Code
+    c|cs|cpp|css|drawio|html|htm|java|js|jsx|ipynb|patch|php|py|rb|rs|sh|sql|ts|tsx|xml|yaml|yml|go|swift|kt|scala|r|pl|lua|zig|dart|vue|svelte)
+      echo "code" ;;
+    # Archives
+    zip|gz|tgz|tar|bz2|xz|7z|rar)
+      echo "archive" ;;
+    # Text/Data
+    txt|md|csv|tsv|log|json|jsonc|toml|ini|cfg|conf|env|properties)
+      echo "text" ;;
+    # Debug/Communication
+    debug|msg|eml|dmp|pdb|cpuprofile)
+      echo "other" ;;
+    *)
+      echo "unsupported" ;;
+  esac
+}
+
+# Get max file size for a category
+max_size_for() {
+  local category="$1"
+  case "$category" in
+    image)    echo "$MAX_IMAGE_SIZE" ;;
+    video)    echo "$MAX_VIDEO_SIZE" ;;
+    audio)    echo "$MAX_AUDIO_SIZE" ;;
+    document) echo "$MAX_DOCUMENT_SIZE" ;;
+    code)     echo "$MAX_CODE_SIZE" ;;
+    archive)  echo "$MAX_ARCHIVE_SIZE" ;;
+    text)     echo "$MAX_OTHER_SIZE" ;;
+    other)    echo "$MAX_OTHER_SIZE" ;;
+    *)        echo "$MAX_OTHER_SIZE" ;;
+  esac
+}
+
+# Get markdown prefix icon for a category
+markdown_icon() {
+  local category="$1"
+  case "$category" in
+    image)    echo "" ;;    # No prefix — uses ![label](url)
+    video)    echo "▶ " ;;
+    audio)    echo "🔊 " ;;
+    document) echo "📄 " ;;
+    code)     echo "📝 " ;;
+    archive)  echo "📦 " ;;
+    text)     echo "📝 " ;;
+    other)    echo "📎 " ;;
+    *)        echo "📎 " ;;
+  esac
+}
+
+# --- Helpers ---------------------------------------------------------------
+
+die() { echo "error: $*" >&2; exit 1; }
+
+usage() {
+  cat <<EOF
+Attach files to GitHub and get shareable URLs.
+Replicates GitHub's "Attach files" feature from the CLI.
+
+USAGE
+  gh file-attach [flags] <file> [<file>...]
+
+FLAGS
+  -r, --repo OWNER/REPO   Target repository (default: current repo)
+  -t, --tag TAG            Release tag for storage (default: _attachments)
+  -m, --markdown           Output as markdown syntax
+  -c, --clipboard          Copy output to clipboard
+      --public             Make the release non-draft (required for browser access)
+  -v, --version            Print version
+  -h, --help               Show this help
+
+ARGUMENTS
+  Arguments can be plain file paths or "label:path" pairs.
+  The label is used as the display text in markdown output.
+
+    screenshot.png                  Uses filename as label
+    "Before fix:before.png"         Uses "Before fix" as label
+    "Demo:recording.mp4"            Uses "Demo" as label
+
+MARKDOWN OUTPUT (-m)
+  Images:     ![label](url)           — renders inline on GitHub
+  Videos:     [▶ label](url)          — clickable link
+  Audio:      [🔊 label](url)         — clickable link
+  Documents:  [📄 label](url)         — clickable link
+  Code:       [📝 label](url)         — clickable link
+  Archives:   [📦 label](url)         — clickable link
+
+SUPPORTED FORMATS
+  Images:     png, jpg, jpeg, gif, webp, svg, bmp, ico, tiff, avif
+  Videos:     mp4, mov, webm, avi, mkv
+  Audio:      mp3, wav, ogg, flac, aac, m4a
+  Documents:  pdf, docx, pptx, xlsx, xls, rtf, doc, odt, ods, odp, odg, odf
+  Code:       py, js, ts, tsx, jsx, java, c, cpp, cs, go, rs, rb, sh, sql,
+              html, css, xml, yaml, yml, swift, kt, scala, vue, svelte, and more
+  Archives:   zip, gz, tgz, tar, bz2, xz, 7z, rar
+  Text/Data:  txt, md, csv, tsv, log, json, toml, ini, cfg, conf
+  Other:      debug, msg, eml, dmp, pdb, cpuprofile
+
+SIZE LIMITS
+  Images:     50 MB       Videos:    200 MB
+  Audio:      50 MB       Documents: 25 MB
+  Code:       10 MB       Archives:  50 MB
+  Text/Other: 25 MB
+
+EXAMPLES
+  gh file-attach screenshot.png
+  gh file-attach -m "Before fix:before.png" "After fix:after.png"
+  gh file-attach -m "Demo:recording.mp4" "Logs:debug.log"
+  gh file-attach -m -c "Report:quarterly.pdf" data.csv
+  gh file-attach --public --repo myorg/myrepo *.png
+EOF
+  exit 0
+}
+
+check_prereqs() {
+  command -v gh >/dev/null 2>&1 || die "gh CLI is required. Install: https://cli.github.com"
+  gh auth status >/dev/null 2>&1 || die "Not authenticated. Run: gh auth login"
+}
+
+resolve_repo() {
+  if [[ -n "${REPO:-}" ]]; then
+    echo "$REPO"
+    return
+  fi
+  local repo
+  repo=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) \
+    || die "Not in a git repo and --repo not specified"
+  echo "$repo"
+}
+
+urlencode() {
+  local string="$1"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$string" | jq -rR @uri
+  elif command -v python3 >/dev/null 2>&1; then
+    python3 -c "import urllib.parse, sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$string"
+  else
+    printf '%s' "$string" | sed \
+      -e 's/%/%25/g' \
+      -e 's/ /%20/g' \
+      -e 's/#/%23/g' \
+      -e 's/?/%3F/g' \
+      -e 's/&/%26/g' \
+      -e 's/+/%2B/g' \
+      -e 's/=/%3D/g'
+  fi
+}
+
+file_size() {
+  local file="$1"
+  stat -f%z "$file" 2>/dev/null || stat -c%s "$file" 2>/dev/null
+}
+
+ensure_release() {
+  local repo="$1"
+  local draft_args=()
+  if [[ "${PUBLIC:-false}" != "true" ]]; then
+    draft_args+=(--draft)
+  fi
+
+  if ! gh release view "$RELEASE_TAG" --repo "$repo" >/dev/null 2>&1; then
+    gh release create "$RELEASE_TAG" \
+      --repo "$repo" \
+      --title "$RELEASE_TITLE" \
+      --notes "$RELEASE_BODY" \
+      "${draft_args[@]}" >/dev/null 2>&1 \
+      || die "Failed to create release '$RELEASE_TAG' in $repo"
+    echo "Created release '$RELEASE_TAG' in $repo" >&2
+  fi
+}
+
+unique_name() {
+  local file="$1"
+  local base ext ts rand
+  base=$(basename "$file")
+  ext="${base##*.}"
+  base="${base%.*}"
+  ts=$(date +%Y%m%d-%H%M%S)
+  rand=$(head -c 4 /dev/urandom | od -An -tx4 | tr -d ' ')
+  echo "${base}-${ts}-${rand}.${ext}"
+}
+
+upload_file() {
+  local repo="$1"
+  local file="$2"
+
+  [[ -f "$file" && ! -L "$file" ]] || die "File not found or is a symlink: $file"
+
+  local ext="${file##*.}"
+  ext=$(echo "$ext" | tr '[:upper:]' '[:lower:]')
+
+  local category
+  category=$(classify_file "$ext")
+  [[ "$category" != "unsupported" ]] || die "Unsupported file type: .$ext (run --help to see supported formats)"
+
+  local size max_size
+  size=$(file_size "$file")
+  max_size=$(max_size_for "$category")
+  if [[ "$size" -gt "$max_size" ]]; then
+    die "File too large: $file ($(( size / 1024 / 1024 ))MB, max $(( max_size / 1024 / 1024 ))MB for $category files)"
+  fi
+
+  local asset_name
+  asset_name=$(unique_name "$file")
+
+  # Copy to temp file with unique name so asset filename matches URL
+  local tmp_dir
+  tmp_dir=$(mktemp -d)
+  local tmp_file="${tmp_dir}/${asset_name}"
+  cp "$file" "$tmp_file"
+
+  local upload_ok=true
+  if ! gh release upload "$RELEASE_TAG" "$tmp_file" \
+    --repo "$repo" \
+    --clobber >/dev/null 2>&1; then
+    upload_ok=false
+  fi
+
+  rm -rf "$tmp_dir"
+  [[ "$upload_ok" == true ]] || die "Upload failed for $file"
+
+  local tag_encoded asset_encoded
+  tag_encoded=$(urlencode "$RELEASE_TAG")
+  asset_encoded=$(urlencode "$asset_name")
+
+  # Return: url|category
+  echo "https://github.com/${repo}/releases/download/${tag_encoded}/${asset_encoded}|${category}"
+}
+
+copy_to_clipboard() {
+  local text="$1"
+  if command -v pbcopy >/dev/null 2>&1; then
+    echo -n "$text" | pbcopy
+  elif command -v xclip >/dev/null 2>&1; then
+    echo -n "$text" | xclip -selection clipboard
+  elif command -v xsel >/dev/null 2>&1; then
+    echo -n "$text" | xsel --clipboard --input
+  elif command -v clip.exe >/dev/null 2>&1; then
+    echo -n "$text" | clip.exe
+  else
+    echo "warning: No clipboard tool found (pbcopy/xclip/xsel/clip.exe)" >&2
+    return 1
+  fi
+  echo "Copied to clipboard!" >&2
+}
+
+# Format a single result as markdown
+format_markdown() {
+  local url="$1"
+  local label="$2"
+  local category="$3"
+
+  if [[ "$category" == "image" ]]; then
+    echo "![${label}](${url})"
+  else
+    local icon
+    icon=$(markdown_icon "$category")
+    echo "[${icon}${label}](${url})"
+  fi
+}
+
+# --- Main ------------------------------------------------------------------
+
+main() {
+  check_prereqs
+
+  local markdown=false
+  local clipboard=false
+  local args=()
+  REPO=""
+  PUBLIC="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)    usage ;;
+      -v|--version) echo "gh-file-attach $VERSION"; exit 0 ;;
+      -r|--repo)
+        REPO="${2:?--repo requires OWNER/REPO}"
+        [[ "$REPO" != -* ]] || die "Invalid repo: '$REPO' (must not start with -)"
+        shift 2
+        ;;
+      -t|--tag)
+        RELEASE_TAG="${2:?--tag requires a value}"
+        [[ "$RELEASE_TAG" != -* ]] || die "Invalid tag: '$RELEASE_TAG' (must not start with -)"
+        shift 2
+        ;;
+      -m|--markdown) markdown=true; shift ;;
+      -c|--clipboard) clipboard=true; shift ;;
+      --public)     PUBLIC="true"; shift ;;
+      -*)           die "Unknown flag: $1 (use --help for usage)" ;;
+      *)            args+=("$1"); shift ;;
+    esac
+  done
+
+  [[ ${#args[@]} -gt 0 ]] || die "No files specified. Usage: gh file-attach <file> [<file>...]"
+
+  # Parse arguments into labels and file paths
+  local files=()
+  local labels=()
+  for arg in "${args[@]}"; do
+    if [[ "$arg" == *:* ]]; then
+      if [[ -f "$arg" ]]; then
+        files+=("$arg")
+        labels+=("")
+      else
+        local label="${arg%%:*}"
+        local path="${arg#*:}"
+        files+=("$path")
+        labels+=("$label")
+      fi
+    else
+      files+=("$arg")
+      labels+=("")
+    fi
+  done
+
+  local repo
+  repo=$(resolve_repo)
+
+  ensure_release "$repo"
+
+  local all_output=""
+  local upload_count=0
+  local fail_count=0
+
+  for i in "${!files[@]}"; do
+    local file="${files[$i]}"
+    local label="${labels[$i]}"
+
+    local result
+    if ! result=$(upload_file "$repo" "$file" 2>&1); then
+      echo "$result" >&2
+      (( fail_count++ )) || true
+      continue
+    fi
+
+    local url="${result%%|*}"
+    local category="${result##*|}"
+    (( upload_count++ )) || true
+
+    local line
+    if [[ "$markdown" == true ]]; then
+      if [[ -z "$label" ]]; then
+        label=$(basename "$file")
+      fi
+      line=$(format_markdown "$url" "$label" "$category")
+    else
+      line="$url"
+    fi
+
+    echo "$line"
+    all_output+="${line}"$'\n'
+  done
+
+  # Summary to stderr
+  if [[ ${#files[@]} -gt 1 ]]; then
+    echo "${upload_count} file(s) uploaded" >&2
+    if [[ "$fail_count" -gt 0 ]]; then
+      echo "${fail_count} file(s) failed" >&2
+    fi
+  fi
+
+  if [[ "$clipboard" == true && -n "$all_output" ]]; then
+    copy_to_clipboard "${all_output%$'\n'}"
+  fi
+
+  # Exit with error if any uploads failed
+  [[ "$fail_count" -eq 0 ]] || exit 1
+}
+
+main "$@"
