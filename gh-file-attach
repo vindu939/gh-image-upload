@@ -209,6 +209,14 @@ ensure_release() {
       "${draft_args[@]}" >/dev/null 2>&1 \
       || die "Failed to create release '$RELEASE_TAG' in $repo"
     echo "Created release '$RELEASE_TAG' in $repo" >&2
+  elif [[ "${PUBLIC:-false}" == "true" ]]; then
+    # If release exists but --public was requested, ensure it's not a draft
+    local is_draft
+    is_draft=$(gh release view "$RELEASE_TAG" --repo "$repo" --json isDraft --jq '.isDraft' 2>/dev/null || echo "false")
+    if [[ "$is_draft" == "true" ]]; then
+      gh release edit "$RELEASE_TAG" --repo "$repo" --draft=false >/dev/null 2>&1
+      echo "Updated release '$RELEASE_TAG' to public in $repo" >&2
+    fi
   fi
 }
 
